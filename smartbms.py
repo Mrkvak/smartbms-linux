@@ -28,6 +28,8 @@ Usage:
   python smartbms.py scan
   python smartbms.py monitor [--pin 0000] [--address AA:BB:..]
   python smartbms.py read    [--pin 0000] [--json]
+  python smartbms.py log     [--pin 0000] [--csv] [--output log.csv]
+  python smartbms.py soc-history [--pin 0000] [--output soc.csv]
   python smartbms.py set <param> <value> [--pin 0000]
   python smartbms.py set --list
   python smartbms.py raw "<command>" [--pin 0000]
@@ -36,6 +38,8 @@ Requires: bleak  (pip install bleak)
 """
 import argparse
 import asyncio
+import csv
+import datetime as dt
 import json
 import sys
 import time
@@ -87,6 +91,8 @@ RESTART_DELAY_STEP = 5       # seconds
 SYNC_TAIL_STEP = 0.2         # amps
 POWER_STEP_GEN3 = 0.05       # current, gen3 (amps per count)
 POWER_STEP_GEN2 = 0.125      # current, gen2
+STREAM_PING_INTERVAL = 0.33  # seconds; official app uses 330 ms on Gen2+
+STREAM_POLL_INTERVAL = 0.10  # keep UI/keepalive responsive while waiting
 
 SENSOR_TYPES = {-1: "Unknown", 0: "125A/5A", 1: "250A/10A",
                 2: "500A/20A", 11: "1000A/40A"}
@@ -94,6 +100,15 @@ CHEMISTRIES = {-1: "Unknown", 0: "Other", 1: "LFP", 2: "LTO", 3: "NMC", 4: "NCA"
 RELAY_FUNCTIONS = {-1: "Unknown", 1: "AllowedToCharge", 2: "AllowedToDischarge",
                    3: "MainRelay", 4: "Prealarm"}
 RELAY_FORCE_POS = {-1: "Unknown", 0: "Inactive", 1: "KeepOff", 2: "KeepOn"}
+CELL_LOG_TYPES = {
+    0: "Unknown",
+    1: "Vlow",
+    2: "Vhigh",
+    3: "TlowCharge",
+    4: "Thigh",
+    5: "Communication",
+    6: "TlowDischarge",
+}
 
 
 # --------------------------------------------------------------------------
@@ -357,6 +372,13 @@ class BmsConnection:
 
     async def next_line(self, timeout):
         return await asyncio.wait_for(self._lines.get(), timeout)
+
+    def get_pending_lines(self):
+        """Return all complete lines already received without blocking."""
+        lines = []
+        while not self._lines.empty():
+            lines.append(self._lines.get_nowait())
+        return lines
 
     async def query(self, command, timeout=3.0):
         """Send a read command; return the first data line (echo skipped).
@@ -660,9 +682,11 @@ async def read_config(conn):
 # --------------------------------------------------------------------------
 class LiveState:
     """Accumulates streamed records into a snapshot."""
-    def __init__(self, gen3):
+    def __init__(self, bms):
+        gen3 = bms["gen3"] if isinstance(bms, dict) else bool(bms)
         self.gen3 = gen3
         self.power_step = POWER_STEP_GEN3 if gen3 else POWER_STEP_GEN2
+        self.cfg = bms if isinstance(bms, dict) else {}
         self.data = {}
         self.cells = {}
 
@@ -679,12 +703,14 @@ class LiveState:
                 d["solar_current"] = None if is_na(parts[2]) else round(parse_int(parts[2]) * self.power_step, 2)
                 d["battery_current"] = round(parse_int(parts[3]) * self.power_step, 2)
                 d["consumption_current"] = None if is_na(parts[4]) else round(parse_int(parts[4]) * self.power_step, 2)
+                self._update_powers()
             elif t == 'V' and len(parts) == 6:
                 d["cell_v_min"] = round(parse_voltage(parts[1]), 3)
                 d["cell_v_min_nr"] = parse_int(parts[2])
                 d["cell_v_max"] = round(parse_voltage(parts[3]), 3)
                 d["cell_v_max_nr"] = parse_int(parts[4])
                 d["balance_voltage"] = round(parse_voltage(parts[5]), 3)
+                self._update_cell_statuses()
             elif t == 'T' and len(parts) in (5, 6):
                 d["temp_min"] = parse_temperature(parts[1])
                 d["temp_min_nr"] = parse_int(parts[2])
@@ -699,11 +725,17 @@ class LiveState:
                 d["cell_count"] = parse_int(parts[2])
                 v = round(parse_voltage(parts[3]), 3)
                 temp = parse_temperature(parts[4])
+                if "temp_min" in d and "temp_max" in d:
+                    avg_temp = (d["temp_min"] + d["temp_max"]) / 2.0
+                    if temp < avg_temp:
+                        temp += 1
+                    elif temp > avg_temp:
+                        temp -= 1
                 self._status1(parse_int(parts[5]))
                 if len(parts) >= 7:
                     self._status2(parse_int(parts[6]))
                 if not d.get("communication_error") and nr <= d["cell_count"]:
-                    self.cells[nr] = {"voltage": v, "temperature": temp}
+                    self.cells[nr] = self._cell(nr, v, temp)
             elif t == 'E' and len(parts) == 5:
                 d["solar_energy_today_kwh"] = parse_int(parts[1]) / 1000.0
                 d["battery_energy_stored_kwh"] = parse_int(parts[2]) / 1000.0
@@ -716,7 +748,8 @@ class LiveState:
                 if len(hm) == 2:
                     d["device_time"] = f"{parse_int(hm[0]):02d}:{parse_int(hm[1]):02d}"
             elif t == 'H' and len(parts) == 7:
-                d["state_of_health_percent"] = parse_int(parts[1])
+                soh = parse_int(parts[1])
+                d["state_of_health_percent"] = None if soh == 255 else soh
                 d["measured_capacity_wh"] = parse_int(parts[2])
                 d["measured_charge_capacity_wh"] = parse_int(parts[3])
                 d["charge_efficiency_percent"] = parse_int(parts[4])
@@ -729,6 +762,50 @@ class LiveState:
                 d["discharged_energy_today_kwh"] = parse_int(parts[4]) / 1000.0
         except (IndexError, ValueError):
             pass
+
+    def _update_powers(self):
+        d = self.data
+        voltage = d.get("battery_voltage")
+        if voltage is None:
+            return
+        if d.get("solar_current") is not None:
+            d["solar_power_w"] = round(voltage * d["solar_current"], 1)
+        if d.get("battery_current") is not None:
+            d["battery_power_w"] = round(voltage * d["battery_current"], 1)
+        if d.get("consumption_current") is not None:
+            d["load_power_w"] = round(voltage * d["consumption_current"], 1)
+
+    def _cell(self, nr, voltage, temperature):
+        cell = {"voltage": voltage, "temperature": temperature}
+        cell.update(self._cell_status(voltage, temperature))
+        return cell
+
+    def _cell_status(self, voltage, temperature):
+        balance = self.data.get("balance_voltage", self.cfg.get("balance_voltage"))
+        v_low = self.cfg.get("cell_voltage_min")
+        v_high = self.cfg.get("cell_voltage_max")
+        t_low = self.cfg.get("temp_charge_min")
+        t_high = self.cfg.get("temp_max")
+        voltage_error = (
+            (v_low is not None and voltage <= v_low) or
+            (v_high is not None and voltage >= v_high)
+        )
+        temperature_error = (
+            (t_low is not None and temperature <= t_low) or
+            (t_high is not None and temperature >= t_high)
+        )
+        balancing = balance is not None and voltage >= balance
+        status = "error" if voltage_error or temperature_error else ("balancing" if balancing else "ok")
+        return {
+            "status": status,
+            "balancing": balancing,
+            "voltage_error": voltage_error,
+            "temperature_error": temperature_error,
+        }
+
+    def _update_cell_statuses(self):
+        for nr, cell in list(self.cells.items()):
+            self.cells[nr] = self._cell(nr, cell["voltage"], cell["temperature"])
 
     def _status1(self, state):
         b = [(state >> i) & 1 for i in range(8)]
@@ -761,6 +838,86 @@ class LiveState:
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
+def _write_csv(rows, fieldnames, output):
+    f = open(output, "w", newline="") if output else sys.stdout
+    try:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    finally:
+        if output:
+            f.close()
+
+
+async def read_soc_history(conn):
+    values = []
+    start_index = None
+    for block in range(14):
+        line = await conn.query(f"H{block:X}@", timeout=4.0)
+        parts = line.split('_')
+        if len(parts) != 3:
+            raise ValueError(f"bad SoC history line: {line}")
+        idx = parse_int(parts[0])
+        start_index = idx + 1
+        if start_index == 168:
+            start_index = 0
+        packed = parts[1]
+        if len(packed) < 24:
+            raise ValueError(f"bad SoC history data: {line}")
+        for i in range(12):
+            values.append(parse_int(packed[i * 2:i * 2 + 2], -1))
+
+    if start_index is None:
+        return []
+    rotated = values[start_index:] + values[:start_index]
+    valid = [v for v in rotated if v > -1 and v != 255]
+    valid.reverse()
+    return [
+        {"hours_ago": hours_ago, "state_of_charge_percent": soc}
+        for hours_ago, soc in enumerate(valid)
+    ]
+
+
+async def read_cell_log(conn):
+    now = dt.datetime.now().astimezone()
+    ts_line = await conn.query("TS@", timeout=4.0)
+    ts_parts = ts_line.split('_')
+    if len(ts_parts) != 2:
+        raise ValueError(f"bad log timestamp line: {ts_line}")
+    log_timestamp = parse_int(ts_parts[0])
+    rows = []
+    for log_nr in range(10):
+        line = await conn.query(f"L{log_nr}@", timeout=4.0)
+        parts = line.split('_')
+        if len(parts) != 5:
+            raise ValueError(f"bad log line: {line}")
+        entry_timestamp = parse_int(parts[0])
+        type_code = parse_int(parts[1])
+        log_type = CELL_LOG_TYPES.get(type_code, f"type{type_code}")
+        if log_type == "Unknown":
+            continue
+        raw_value = parts[2]
+        cell_nr = parse_int(parts[3])
+        voltage = ""
+        temperature = ""
+        if log_type in ("Vlow", "Vhigh"):
+            voltage = round(parse_voltage(raw_value), 3)
+        elif log_type in ("TlowCharge", "Thigh", "TlowDischarge"):
+            temperature = parse_temperature(raw_value)
+        occurred = now - dt.timedelta(seconds=max(0, log_timestamp - entry_timestamp))
+        rows.append({
+            "log_nr": log_nr,
+            "occurred_at": occurred.isoformat(timespec="seconds"),
+            "seconds_ago": max(0, log_timestamp - entry_timestamp),
+            "type": log_type,
+            "cell_nr": cell_nr,
+            "voltage": voltage,
+            "temperature": temperature,
+            "timestamp": entry_timestamp,
+        })
+    return rows
+
+
 async def cmd_scan(args):
     print("Scanning for 123\\SmartBMS devices (%.0fs)...\n" % args.timeout)
     devices = await discover(args.timeout)
@@ -791,27 +948,36 @@ async def cmd_read(args):
 
 async def cmd_monitor(args):
     client, conn, bms = await connect(args.address, args.pin)
-    state = LiveState(bms["gen3"])
+    state = LiveState(bms)
+    refresh_interval = max(args.interval, 0.05)
     try:
         await conn.command("D!")           # stop any existing stream
+        conn.drain()
         r = await conn.command("E!")       # start streaming
         if r != "OK":
             print(f"Failed to start data stream: {r}", file=sys.stderr)
             return
+        conn.drain()
         print("Streaming live data. Press Ctrl-C to stop.\n", file=sys.stderr)
         last_ping = time.monotonic()
         last_print = 0.0
         while True:
+            timeout = min(STREAM_POLL_INTERVAL, refresh_interval)
             try:
-                line = await conn.next_line(2.0)
-                state.feed(line.strip())
+                lines = [await conn.next_line(timeout)]
             except asyncio.TimeoutError:
-                pass
+                lines = []
+            lines.extend(conn.get_pending_lines())
+            for line in lines:
+                line = line.strip()
+                if line in ("", "E!", "D!", "OK", "KO", "NA"):
+                    continue
+                state.feed(line)
             now = time.monotonic()
-            if now - last_ping > 1.5:       # keep-alive
+            if now - last_ping >= STREAM_PING_INTERVAL:
                 await conn.ping()
                 last_ping = now
-            if now - last_print > args.interval:
+            if now - last_print >= refresh_interval:
                 _print_live(state.snapshot(), args.json)
                 last_print = now
     except KeyboardInterrupt:
@@ -826,25 +992,40 @@ async def cmd_monitor(args):
 
 def _print_live(s, as_json):
     if as_json:
-        print(json.dumps(s))
+        print(json.dumps(s), flush=True)
         return
-    # Clear screen and print a compact dashboard.
-    print("\033[2J\033[H", end="")
+    # Clear screen and print a compact dashboard in one write to avoid partial
+    # repaints when BLE notifications arrive rapidly.
+    out = ["\033[2J\033[3J\033[H"]
     soc = s.get("state_of_charge_percent", "?")
-    print(f"123\\SmartBMS live @ {s.get('device_time','--:--')}   "
-          f"SoC {soc}%   SoH {s.get('state_of_health_percent','?')}%")
-    print("-" * 56)
-    print(f"  Battery voltage : {s.get('battery_voltage','?')} V")
-    print(f"  Battery current : {s.get('battery_current','?')} A")
+    if "state_of_health_percent" in s:
+        soh = s["state_of_health_percent"]
+        soh_text = "Unknown" if soh is None else f"{soh}%"
+    else:
+        soh_text = "?"
+    out.append(f"123\\SmartBMS live @ {s.get('device_time','--:--')}   "
+               f"SoC {soc}%   SoH {soh_text}")
+    out.append("-" * 56)
+    out.append(f"  Battery voltage : {s.get('battery_voltage','?')} V")
+    out.append(f"  Battery current : {s.get('battery_current','?')} A")
+    if "battery_power_w" in s:
+        out.append(f"  Battery power   : {s.get('battery_power_w')} W")
     if s.get("solar_current") is not None:
-        print(f"  Solar current   : {s.get('solar_current')} A")
+        out.append(f"  Solar current   : {s.get('solar_current')} A")
+    if "solar_power_w" in s:
+        out.append(f"  Solar power     : {s.get('solar_power_w')} W")
     if s.get("consumption_current") is not None:
-        print(f"  Load current    : {s.get('consumption_current')} A")
-    print(f"  Stored energy   : {s.get('battery_energy_stored_kwh','?')} kWh")
-    print(f"  Cell V min/max  : {s.get('cell_v_min','?')} (#{s.get('cell_v_min_nr','?')}) "
-          f"/ {s.get('cell_v_max','?')} (#{s.get('cell_v_max_nr','?')}) V")
-    print(f"  Temp min/max    : {s.get('temp_min','?')} (#{s.get('temp_min_nr','?')}) "
-          f"/ {s.get('temp_max','?')} (#{s.get('temp_max_nr','?')}) C")
+        out.append(f"  Load current    : {s.get('consumption_current')} A")
+    if "load_power_w" in s:
+        out.append(f"  Load power      : {s.get('load_power_w')} W")
+    out.append(f"  Stored energy   : {s.get('battery_energy_stored_kwh','?')} kWh")
+    if "charged_energy_today_kwh" in s or "discharged_energy_today_kwh" in s:
+        out.append(f"  Charged today   : {s.get('charged_energy_today_kwh','?')} kWh")
+        out.append(f"  Discharged today: {s.get('discharged_energy_today_kwh','?')} kWh")
+    out.append(f"  Cell V min/max  : {s.get('cell_v_min','?')} (#{s.get('cell_v_min_nr','?')}) "
+               f"/ {s.get('cell_v_max','?')} (#{s.get('cell_v_max_nr','?')}) V")
+    out.append(f"  Temp min/max    : {s.get('temp_min','?')} (#{s.get('temp_min_nr','?')}) "
+               f"/ {s.get('temp_max','?')} (#{s.get('temp_max_nr','?')}) C")
     flags = []
     for name, key in (("CHG-OK", "allow_to_charge"), ("DSG-OK", "allow_to_discharge"),
                       ("Vmin!", "exceed_v_min"), ("Vmax!", "exceed_v_max"),
@@ -852,12 +1033,57 @@ def _print_live(s, as_json):
                       ("COMM-ERR", "communication_error"), ("ERROR", "error")):
         if s.get(key):
             flags.append(name)
-    print(f"  Status          : {'  '.join(flags) if flags else '-'}")
+    out.append(f"  Status          : {'  '.join(flags) if flags else '-'}")
     cells = s.get("cells", [])
     if cells:
-        print(f"  Cells ({len(cells)}):")
+        out.append(f"  Cells ({len(cells)}):")
         for c in cells:
-            print(f"    #{c['nr']:<2} {c['voltage']:.3f} V  {c['temperature']}C")
+            out.append(f"    #{c['nr']:<2} {c['voltage']:.3f} V  "
+                       f"{c['temperature']}C  {_cell_status_label(c)}")
+    print("\n".join(out), flush=True)
+
+
+def _cell_status_label(cell):
+    status = cell.get("status", "ok")
+    labels = {"ok": "OK", "balancing": "BAL", "error": "ERR"}
+    label = labels.get(status, status.upper())
+    if not sys.stdout.isatty():
+        return label
+    colors = {"ok": "\033[32m", "balancing": "\033[33m", "error": "\033[31m"}
+    return f"{colors.get(status, '')}{label}\033[0m"
+
+
+async def cmd_log(args):
+    client, conn, _bms = await connect(args.address, args.pin, read_settings=False)
+    try:
+        rows = await read_cell_log(conn)
+    finally:
+        await client.disconnect()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    elif args.csv or args.output:
+        _write_csv(rows, ["log_nr", "occurred_at", "seconds_ago", "type",
+                          "cell_nr", "voltage", "temperature", "timestamp"],
+                   args.output)
+    else:
+        if not rows:
+            print("No log entries.")
+            return
+        print("Log  Time                       Type            Cell  Value")
+        for row in rows:
+            value = f"{row['voltage']} V" if row["voltage"] != "" else (
+                f"{row['temperature']} C" if row["temperature"] != "" else "")
+            print(f"{row['log_nr']:<4} {row['occurred_at']:<25} "
+                  f"{row['type']:<15} {row['cell_nr']:<5} {value}")
+
+
+async def cmd_soc_history(args):
+    client, conn, _bms = await connect(args.address, args.pin, read_settings=False)
+    try:
+        rows = await read_soc_history(conn)
+    finally:
+        await client.disconnect()
+    _write_csv(rows, ["hours_ago", "state_of_charge_percent"], args.output)
 
 
 async def cmd_set(args):
@@ -961,6 +1187,18 @@ def main():
     r = sub.add_parser("read", help="Read and print configuration", parents=[common])
     r.add_argument("--json", action="store_true")
     r.set_defaults(func=cmd_read)
+
+    lg = sub.add_parser("log", aliases=["error-log", "cell-log"],
+                        help="Read the BMS cell/error log", parents=[common])
+    lg.add_argument("--json", action="store_true", help="Emit JSON")
+    lg.add_argument("--csv", action="store_true", help="Emit CSV")
+    lg.add_argument("--output", help="Write CSV to this file")
+    lg.set_defaults(func=cmd_log)
+
+    sh = sub.add_parser("soc-history", help="Export hourly SoC history as CSV",
+                        parents=[common])
+    sh.add_argument("--output", help="Write CSV to this file (default stdout)")
+    sh.set_defaults(func=cmd_soc_history)
 
     w = sub.add_parser("set", help="Write a configuration parameter", parents=[common])
     w.add_argument("param", nargs="?", help="Parameter name (see --list)")

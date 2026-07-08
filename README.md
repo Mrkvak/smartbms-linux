@@ -8,6 +8,14 @@ history, and send raw protocol commands.
 The protocol is an ASCII line protocol over BLE UART and was reverse engineered
 from the official Android app.
 
+## Project Layout
+
+- `smartbmslib/core.py`: reusable BLE transport, protocol commands, parsers,
+  config readers, live-state parser, log reader, and SoC history reader
+- `smartbmslib/cli.py`: command-line interface built on the library
+- `smartbmslib/__main__.py`: package entry point for `python -m smartbmslib`
+- `smartbms.py`: small executable wrapper that calls `smartbmslib.cli.main()`
+
 ## Requirements
 
 - Linux with Bluetooth LE support
@@ -37,6 +45,12 @@ Scan for nearby SmartBMS devices:
 
 ```bash
 ./venv/bin/python smartbms.py scan
+```
+
+The package entry point is equivalent:
+
+```bash
+./venv/bin/python -m smartbmslib scan
 ```
 
 Monitor live values using auto-discovery:
@@ -167,6 +181,32 @@ Send a raw action/write command:
 ```
 
 Raw commands are intended for protocol investigation. Use them carefully.
+
+## Library Usage
+
+Use `smartbmslib` directly from another Python program when you do not want the
+CLI formatting:
+
+```python
+import asyncio
+from smartbmslib import connect, read_soc_history
+
+
+async def main():
+    client, conn, bms = await connect(address=None, pin="<your-pin>")
+    try:
+        print(bms["firmware"])
+        rows = await read_soc_history(conn)
+        print(rows[:3])
+    finally:
+        await client.disconnect()
+
+
+asyncio.run(main())
+```
+
+For live stream parsing, instantiate `LiveState` with the config returned by
+`connect()` and feed it live protocol lines from `conn.next_line()`.
 
 ## Notes
 
